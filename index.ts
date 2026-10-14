@@ -220,6 +220,25 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           required: ["title", "overview"],
         },
       },
+      {
+        name: "create_session",
+        description: "Alias for create_session_moc. Create a structured Session MOC note in Obsidian, link parent session and related topics, and update Sessions Index.md",
+        inputSchema: {
+          type: "object",
+          properties: {
+            title: { type: "string", description: "Short summary title of the session" },
+            overview: { type: "string", description: "Comprehensive summary of the session" },
+            parentSession: { type: "string", description: "Optional name of the parent session to branch/resume from (defaults to most recent session)" },
+            topics: { type: "array", items: { type: "string" }, description: "List of topics or inquiries discussed" },
+            decisions: { type: "array", items: { type: "string" }, description: "List of architectural or design decisions made" },
+            tips: { type: "array", items: { type: "string" }, description: "List of tips, insights, or pitfalls discovered" },
+            relatedEntities: { type: "array", items: { type: "string" }, description: "Names of entities to include in the Map of Content" },
+            nextSteps: { type: "array", items: { type: "string" }, description: "Next steps or carry-overs for subsequent sessions" },
+            tags: { type: "array", items: { type: "string" }, description: "Optional extra tags (e.g. ['project/smb'])" }
+          },
+          required: ["title", "overview"],
+        },
+      },
     ],
   };
 });
@@ -254,11 +273,13 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
     case "open_nodes":
       return { content: [{ type: "text", text: JSON.stringify(await storageManager.openNodes(args.names as string[]), null, 2) }] };
     case "create_session_moc":
+    case "create_session":
       return { content: [{ type: "text", text: JSON.stringify(await storageManager.createSessionMoc(args as any), null, 2) }] };
     default:
       throw new Error(`Unknown tool: ${name}`);
   }
 });
+
 
 async function main() {
   const transport = new StdioServerTransport();
