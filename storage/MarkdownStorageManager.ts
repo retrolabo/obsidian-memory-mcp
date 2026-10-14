@@ -404,19 +404,24 @@ export class MarkdownStorageManager {
     const entityName = `Session ${dateStr} ${cleanTitle}`;
     const filePath = getEntityPath(entityName);
 
-    // 1. Find previous session file
-    const files = await fs.readdir(this.memoryDir);
-    const sessionFiles = files
-      .filter(f => f.startsWith('Session ') && f.endsWith('.md') && !f.includes('Index'))
-      .sort()
-      .reverse();
-    
+    // 1. Find previous / parent session file
     let prevSessionName: string | null = null;
-    for (const sf of sessionFiles) {
-      const name = sf.replace(/\.md$/, '');
-      if (name !== entityName) {
-        prevSessionName = name;
-        break;
+    if (params.parentSession) {
+      const cleanParent = params.parentSession.replace(/\.md$/, '').trim();
+      prevSessionName = cleanParent;
+    } else {
+      const files = await fs.readdir(this.memoryDir);
+      const sessionFiles = files
+        .filter(f => f.startsWith('Session ') && f.endsWith('.md') && !f.includes('Index'))
+        .sort()
+        .reverse();
+      
+      for (const sf of sessionFiles) {
+        const name = sf.replace(/\.md$/, '');
+        if (name !== entityName) {
+          prevSessionName = name;
+          break;
+        }
       }
     }
 

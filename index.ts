@@ -209,6 +209,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
           properties: {
             title: { type: "string", description: "Short summary title of the session" },
             overview: { type: "string", description: "Comprehensive summary of the session" },
+            parentSession: { type: "string", description: "Optional name of the parent session to branch/resume from (defaults to most recent session)" },
             topics: { type: "array", items: { type: "string" }, description: "List of topics or inquiries discussed" },
             decisions: { type: "array", items: { type: "string" }, description: "List of architectural or design decisions made" },
             tips: { type: "array", items: { type: "string" }, description: "List of tips, insights, or pitfalls discovered" },

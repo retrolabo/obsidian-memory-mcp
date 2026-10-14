@@ -20,6 +20,7 @@ export interface KnowledgeGraph {
 export interface CreateSessionMocParams {
   title: string;
   overview: string;
+  parentSession?: string; // Explicit parent session to branch/resume from
   topics?: string[];
   decisions?: string[];
   tips?: string[];
