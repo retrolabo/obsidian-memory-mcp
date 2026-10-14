@@ -16,3 +16,14 @@ export interface KnowledgeGraph {
   entities: Entity[];
   relations: Relation[];
 }
+
+export interface CreateSessionMocParams {
+  title: string;
+  overview: string;
+  topics?: string[];
+  decisions?: string[];
+  tips?: string[];
+  relatedEntities?: string[];
+  nextSteps?: string[];
+  tags?: string[];
+}

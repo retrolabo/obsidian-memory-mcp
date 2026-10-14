@@ -1,6 +1,7 @@
 import { promises as fs } from 'fs';
 import path from 'path';
-import { Entity, Relation, KnowledgeGraph } from '../types.js';
+import matter from 'gray-matter';
+import { Entity, Relation, KnowledgeGraph, CreateSessionMocParams } from '../types.js';
 import { 
   getMemoryDir, 
   getEntityPath, 
@@ -380,6 +381,230 @@ export class MarkdownStorageManager {
     return {
       entities: filteredEntities,
       relations: filteredRelations
+    };
+  }
+
+  /**
+   * Create a structured Session MOC (Map of Content) note
+   */
+  async createSessionMoc(params: CreateSessionMocParams): Promise<{ entityName: string; filePath: string }> {
+    await this.ensureMemoryDir();
+
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const day = String(now.getDate()).padStart(2, '0');
+    const hours = String(now.getHours()).padStart(2, '0');
+    const minutes = String(now.getMinutes()).padStart(2, '0');
+    const dateStr = `${year}-${month}-${day}_${hours}${minutes}`;
+    const todayYMD = `${year}-${month}-${day}`;
+    const monthTag = `session/${year}-${month}`;
+
+    const cleanTitle = params.title.trim().replace(/^Session\s+/, '');
+    const entityName = `Session ${dateStr} ${cleanTitle}`;
+    const filePath = getEntityPath(entityName);
+
+    // 1. Find previous session file
+    const files = await fs.readdir(this.memoryDir);
+    const sessionFiles = files
+      .filter(f => f.startsWith('Session ') && f.endsWith('.md') && !f.includes('Index'))
+      .sort()
+      .reverse();
+    
+    let prevSessionName: string | null = null;
+    for (const sf of sessionFiles) {
+      const name = sf.replace(/\.md$/, '');
+      if (name !== entityName) {
+        prevSessionName = name;
+        break;
+      }
+    }
+
+    // 2. Prepare tags
+    const tagsSet = new Set<string>();
+    tagsSet.add('session');
+    tagsSet.add(monthTag);
+    if (params.tags && Array.isArray(params.tags)) {
+      params.tags.forEach(t => tagsSet.add(t.trim().replace(/^#/, '')));
+    }
+
+    // 3. Prepare frontmatter
+    const frontmatter: Record<string, any> = {
+      entityType: 'session',
+      tags: Array.from(tagsSet),
+      created: todayYMD,
+      updated: todayYMD
+    };
+
+    // 4. Build MOC content sections
+    let content = matter.stringify('', frontmatter);
+    content += `# ${entityName}\n\n`;
+
+    // Overview section
+    content += `## 概要\n${params.overview.trim()}\n\n`;
+
+    // Navigation section
+    content += `## ナビゲーション\n`;
+    content += `- ⬆️ 目次: [[Sessions Index]]\n`;
+    if (prevSessionName) {
+      content += `- ⬅️ 前のセッション: [[followed_by::${prevSessionName}]]\n`;
+    }
+    content += `\n`;
+
+    // Topics section
+    if (params.topics && params.topics.length > 0) {
+      content += `## 相談・議論内容\n`;
+      for (const t of params.topics) {
+        content += `- ${t}\n`;
+      }
+      content += `\n`;
+    }
+
+    // Decisions section
+    if (params.decisions && params.decisions.length > 0) {
+      content += `## 決定事項 (Decisions)\n`;
+      for (const d of params.decisions) {
+        content += `- ${d}\n`;
+      }
+      content += `\n`;
+    }
+
+    // Tips section
+    if (params.tips && params.tips.length > 0) {
+      content += `## 知見・Tips (Knowledge)\n`;
+      for (const t of params.tips) {
+        content += `- ${t}\n`;
+      }
+      content += `\n`;
+    }
+
+    // Related entities (Map of Content)
+    if (params.relatedEntities && params.relatedEntities.length > 0) {
+      content += `## 関連ノート（Map of Content）\n`;
+      for (const re of params.relatedEntities) {
+        content += `- [[${re.trim()}]]\n`;
+      }
+      content += `\n`;
+    }
+
+    // Next steps
+    if (params.nextSteps && params.nextSteps.length > 0) {
+      content += `## 次回への申し送り (Next Steps)\n`;
+      for (const ns of params.nextSteps) {
+        content += `- ${ns}\n`;
+      }
+      content += `\n`;
+    }
+
+    // Observations section (for standard MCP memory search)
+    content += `## Observations\n`;
+    content += `- 概要: ${params.overview.trim()}\n`;
+    if (params.topics) {
+      params.topics.forEach(t => { content += `- 相談: ${t}\n`; });
+    }
+    if (params.decisions) {
+      params.decisions.forEach(d => { content += `- 決定: ${d}\n`; });
+    }
+    if (params.tips) {
+      params.tips.forEach(t => { content += `- Tips: ${t}\n`; });
+    }
+    if (params.nextSteps) {
+      params.nextSteps.forEach(ns => { content += `- 申し送り: ${ns}\n`; });
+    }
+    content += `\n`;
+
+    // Relations section
+    content += `## Relations\n`;
+    content += `- [[indexed_in::Sessions Index]]\n`;
+    if (prevSessionName) {
+      content += `- [[followed_by::${prevSessionName}]]\n`;
+    }
+    if (params.relatedEntities) {
+      for (const re of params.relatedEntities) {
+        content += `- [[related_to::${re.trim()}]]\n`;
+      }
+    }
+    content += `\n`;
+
+    // Write the new session file
+    await fs.writeFile(filePath, content, 'utf-8');
+
+    // 5. Update previous session file with forward link
+    if (prevSessionName) {
+      const prevPath = getEntityPath(prevSessionName);
+      try {
+        let prevContent = await fs.readFile(prevPath, 'utf-8');
+        if (prevContent.includes('## ナビゲーション')) {
+          prevContent = prevContent.replace(
+            '## ナビゲーション\n',
+            `## ナビゲーション\n- ➡️ 次のセッション: [[preceded_by::${entityName}]]\n`
+          );
+        }
+        const updatedPrev = addRelationToContent(prevContent, {
+          from: prevSessionName,
+          to: entityName,
+          relationType: 'preceded_by'
+        });
+        await fs.writeFile(prevPath, updatedPrev, 'utf-8');
+      } catch (e) {
+        console.error(`Failed to update forward link in ${prevSessionName}:`, e);
+      }
+    }
+
+    // 6. Update Sessions Index.md
+    const indexPath = path.join(this.memoryDir, 'Sessions Index.md');
+    try {
+      let indexContent = await fs.readFile(indexPath, 'utf-8');
+      const entryText = `- [[${entityName}]]\n  - 主な内容: ${params.overview.trim()}\n`;
+      if (indexContent.includes('## セッション一覧（新しい順）\n\n')) {
+        indexContent = indexContent.replace(
+          '## セッション一覧（新しい順）\n\n',
+          `## セッション一覧（新しい順）\n\n${entryText}`
+        );
+        await fs.writeFile(indexPath, indexContent, 'utf-8');
+      } else if (indexContent.includes('## セッション一覧（新しい順）\n')) {
+        indexContent = indexContent.replace(
+          '## セッション一覧（新しい順）\n',
+          `## セッション一覧（新しい順）\n${entryText}`
+        );
+        await fs.writeFile(indexPath, indexContent, 'utf-8');
+      }
+    } catch (e) {
+      // Create Sessions Index if not present
+      const newIndex = `---
+entityType: index
+tags:
+  - session
+  - index
+created: '${todayYMD}'
+updated: '${todayYMD}'
+---
+
+# Sessions Index（セッション履歴・目次）
+
+各会話セッションの要約と、そのセッションで生まれた決定・Tips・作業状態を時系列で辿るためのインデックスです。
+
+## セッション一覧（新しい順）
+
+- [[${entityName}]]
+  - 主な内容: ${params.overview.trim()}
+
+---
+
+## Dataview（プラグイン有効時）
+
+\`\`\`dataview
+TABLE created, tags, file.outlinks AS "Links"
+FROM #session AND !"Sessions Index"
+SORT file.name DESC
+\`\`\`
+`;
+      await fs.writeFile(indexPath, newIndex, 'utf-8');
+    }
+
+    return {
+      entityName,
+      filePath
     };
   }
 }
