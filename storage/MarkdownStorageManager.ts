@@ -46,7 +46,9 @@ export class MarkdownStorageManager {
       return {
         name: entityName,
         entityType: parsed.metadata.entityType || 'unknown',
-        observations: parsed.observations
+        observations: parsed.observations,
+        tags: parsed.metadata.tags || [],
+        created: parsed.metadata.created
       };
     } catch (error) {
       if (error instanceof Error && 'code' in error && (error as any).code === 'ENOENT') {
@@ -340,6 +342,7 @@ export class MarkdownStorageManager {
     const filteredEntities = graph.entities.filter(e => 
       e.name.toLowerCase().includes(queryLower) ||
       e.entityType.toLowerCase().includes(queryLower) ||
+      (e.tags && e.tags.some(t => t.toLowerCase().includes(queryLower))) ||
       e.observations.some(o => o.toLowerCase().includes(queryLower))
     );
     

@@ -3,6 +3,7 @@ import { Entity, Relation } from '../types.js';
 
 interface MarkdownMetadata {
   entityType: string;
+  tags?: string[];
   created?: string;
   updated?: string;
 }
@@ -22,7 +23,22 @@ interface ParsedMarkdown {
  */
 export function parseMarkdown(content: string, entityName: string): ParsedMarkdown {
   const parsed = matter(content);
-  const metadata = parsed.data as MarkdownMetadata;
+
+  // Extract and normalize tags from frontmatter
+  let tags: string[] = [];
+  const rawTags = (parsed.data as any)?.tags;
+  if (Array.isArray(rawTags)) {
+    tags = rawTags.map(t => String(t).trim().replace(/^#/, '')).filter(Boolean);
+  } else if (typeof rawTags === 'string') {
+    tags = rawTags.split(',').map(t => t.trim().replace(/^#/, '')).filter(Boolean);
+  }
+
+  const metadata: MarkdownMetadata = {
+    entityType: (parsed.data as any)?.entityType || 'unknown',
+    tags,
+    created: (parsed.data as any)?.created,
+    updated: (parsed.data as any)?.updated,
+  };
   
   // Extract observations from the content
   const observations: string[] = [];
@@ -104,18 +120,73 @@ export function parseMarkdown(content: string, entityName: string): ParsedMarkdo
 }
 
 /**
+ * Derive automatic tags based on entity name and type
+ */
+export function deriveAutoTags(name: string, entityType: string): string[] {
+  const tags = new Set<string>();
+  const lowerType = (entityType || '').toLowerCase().trim();
+  const lowerName = (name || '').toLowerCase().trim();
+
+  if (lowerType) {
+    tags.add(lowerType);
+  }
+
+  // Derive project tags
+  if (lowerName.includes('smb')) {
+    tags.add('project/smb');
+  }
+  if (lowerName.includes('reton')) {
+    tags.add('project/reton');
+  }
+  if (lowerName.includes('msx')) {
+    tags.add('project/msx');
+  }
+
+  // Derive category tags
+  if (lowerName.startsWith('session ') || lowerName.includes('セッション') || lowerType === 'session') {
+    tags.add('session');
+  }
+  if (lowerName.includes('tips') || lowerName.includes('落とし穴')) {
+    tags.add('tips');
+  }
+  if (lowerName.includes('再開位置') || lowerName.includes('引き継ぎ')) {
+    tags.add('state');
+  }
+  if (lowerName.includes('決まり') || lowerName.includes('方針') || lowerType === 'rule') {
+    tags.add('rule');
+  }
+  if (lowerName.includes('検査') || lowerName.includes('設定') || lowerName.includes('環境')) {
+    tags.add('reference');
+  }
+
+  return Array.from(tags);
+}
+
+/**
  * Generate markdown content from an entity
  */
 export function generateMarkdown(entity: Entity, relations: Relation[]): string {
   const now = new Date().toISOString().split('T')[0];
-  
+
+  // Prepare tags: if explicitly provided, use them; otherwise auto-derive
+  const tagsSet = new Set<string>();
+  if (entity.tags && Array.isArray(entity.tags) && entity.tags.length > 0) {
+    entity.tags.forEach(t => tagsSet.add(t.trim().replace(/^#/, '')));
+  } else {
+    deriveAutoTags(entity.name, entity.entityType).forEach(t => tagsSet.add(t));
+  }
+
   // Prepare frontmatter
-  const frontmatter = {
+  const frontmatter: Record<string, any> = {
     entityType: entity.entityType,
-    created: now,
+    created: entity.created || now,
     updated: now
   };
-  
+
+  if (tagsSet.size > 0) {
+    frontmatter.tags = Array.from(tagsSet);
+  }
+
   // Build content sections
   let content = matter.stringify('', frontmatter);
   

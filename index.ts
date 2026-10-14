@@ -44,6 +44,11 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     items: { type: "string" },
                     description: "An array of observation contents associated with the entity"
                   },
+                  tags: {
+                    type: "array",
+                    items: { type: "string" },
+                    description: "Optional tags for the entity (e.g. ['project/smb', 'tips', 'session'])"
+                  },
                 },
                 required: ["name", "entityType", "observations"],
               },

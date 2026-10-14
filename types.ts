@@ -2,6 +2,8 @@ export interface Entity {
   name: string;
   entityType: string;
   observations: string[];
+  tags?: string[];
+  created?: string;
 }
 
 export interface Relation {
