@@ -99,6 +99,20 @@ try {
   assert(!(await read('30_Knowledge/tips/T tip.md')).includes('informs::T decision'));
   ok('delete removes inbound relations');
 
+  // --- NFD file names (macOS / Google Drive) and local dates -----------------------
+  const nfc = 'ビルドの落とし穴';
+  const nfd = nfc.normalize('NFD');
+  assert.notEqual(nfc, nfd);
+  await fs.writeFile(path.join(V, '10_Rules', `${nfd}.md`), `---\nentityType: rule\n---\n\n# x\n\n## Observations\n- y\n`);
+  assert.equal((await m.openNodes([nfc])).entities.length, 1);
+  await m.addObservations([{ entityName: nfc, contents: ['z'] }]);
+  u = await m.updateEntities([{ name: nfc, entityType: 'antipattern' }]);
+  assert.equal(u[0].path.normalize('NFC'), `30_Knowledge/antipatterns/${nfc}.md`);
+  const d = new Date();
+  const today = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  assert((await fs.readFile(path.join(V, u[0].path), 'utf8')).includes(`updated: '${today}'`));
+  ok('NFD file names resolve from NFC input; updated uses the local date');
+
   // --- session-start hook ---------------------------------------------------------
   await fs.mkdir(path.join(V, '_system'), { recursive: true });
   await fs.writeFile(path.join(V, '_system/agent-memory-policy.md'), '---\nentityType: system\n---\n<!-- editor note -->\n# Policy\n- shared\n');

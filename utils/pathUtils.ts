@@ -12,7 +12,7 @@ const RESERVED_NAMES = /^(con|prn|aux|nul|com[0-9]|lpt[0-9])$/i;
  */
 export function sanitizeFilename(name: string): string {
   // Replace forbidden characters with underscores
-  let sanitized = name.replace(FORBIDDEN_CHARS, '_');
+  let sanitized = name.normalize('NFC').replace(FORBIDDEN_CHARS, '_');
   
   // Remove leading/trailing dots and spaces
   sanitized = sanitized.trim().replace(/^\.+|\.+$/g, '');
@@ -67,7 +67,9 @@ export function getEntityNameFromPath(filePath: string): string | null {
   if (!basename.endsWith('.md')) {
     return null;
   }
-  return basename.slice(0, -3); // Remove .md extension
+  // Remove .md extension. NFC so names from NFD file systems / sync tools
+  // (e.g. macOS + Google Drive) match what callers type.
+  return basename.slice(0, -3).normalize('NFC');
 }
 
 /**

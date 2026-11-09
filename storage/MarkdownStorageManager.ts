@@ -108,7 +108,8 @@ export class MarkdownStorageManager {
 
   private async resolvePath(name: string, index?: Map<string, string>): Promise<string | undefined> {
     const idx = index || await this.buildIndex();
-    return idx.get(name) ?? idx.get(sanitizeFilename(name));
+    const nfc = name.normalize('NFC');
+    return idx.get(nfc) ?? idx.get(sanitizeFilename(nfc));
   }
 
   private async requirePath(name: string, index?: Map<string, string>): Promise<string> {
@@ -157,7 +158,7 @@ export class MarkdownStorageManager {
       status: parsed.metadata.status,
       path: this.rel(filePath),
     };
-    const relations = parsed.relations.map(r => ({ from: entityName, to: r.to, relationType: r.relationType }));
+    const relations = parsed.relations.map(r => ({ from: entityName, to: r.to.normalize('NFC'), relationType: r.relationType }));
     return { entity, relations };
   }
 
@@ -229,7 +230,7 @@ export class MarkdownStorageManager {
       } catch (error) {
         throw new Error(`Failed to save entity ${entity.name}: ${error}`);
       }
-      index.set(entity.name, filePath);
+      index.set(entity.name.normalize('NFC'), filePath);
 
       const { folder: _ignored, ...rest } = entity;
       created.push({ ...rest, path: this.rel(filePath) });
@@ -244,8 +245,10 @@ export class MarkdownStorageManager {
     const newRelations: Relation[] = [];
 
     for (const relation of relations) {
+      const from = relation.from.normalize('NFC');
+      const to = relation.to.normalize('NFC');
       const exists = graph.relations.some(r =>
-        r.from === relation.from && r.to === relation.to && r.relationType === relation.relationType
+        r.from === from && r.to === to && r.relationType === relation.relationType
       );
       if (exists) continue;
 
@@ -296,12 +299,12 @@ export class MarkdownStorageManager {
           throw new Error(`Failed to delete entity ${name}: ${error}`);
         }
       }
-      index.delete(name);
+      index.delete(name.normalize('NFC'));
     }
 
     // Remove relations pointing to deleted entities
     const notes = await this.loadAll(index);
-    const targets = new Set(entityNames);
+    const targets = new Set(entityNames.map(n => n.normalize('NFC')));
     for (const note of notes) {
       const toRemove = note.relations.filter(r => targets.has(r.to));
       if (toRemove.length === 0) continue;
@@ -390,7 +393,7 @@ export class MarkdownStorageManager {
           }
           await this.ensureDir(path.dirname(target));
           await fs.rename(filePath, target);
-          index.set(u.name, target);
+          index.set(u.name.normalize('NFC'), target);
         }
       }
 
@@ -427,7 +430,8 @@ export class MarkdownStorageManager {
 
   async openNodes(names: string[]): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
-    return this.subgraph(graph, graph.entities.filter(e => names.includes(e.name)));
+    const wanted = new Set(names.map(n => n.normalize('NFC')));
+    return this.subgraph(graph, graph.entities.filter(e => wanted.has(e.name)));
   }
 
   /** Lightweight listing (no observations) for deciding what to load. */
