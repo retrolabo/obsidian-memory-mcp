@@ -270,6 +270,14 @@ npm test
 
 更新後は、両方のエージェントを再起動します。
 
+## 7-1. 旧 clone から移行したとき
+
+別の場所（例: `~/.mcp-servers/obsidian-memory-mcp`）に旧 clone が残っている場合は、次の順で片付けます。
+
+1. 両エージェントの MCP 登録（5-1 など）の `args` を、新しいリポジトリの `dist/index.js` に書き換える。
+2. エージェントを再起動し、6-4 の `list_nodes`（`folder: "10_Rules"`）でルールが返ることを確認する。
+3. どの設定からも旧 clone が参照されていないことを確認してから、旧 clone を削除する。
+
 ## 8. 複数の PC で使うときの注意
 
 - vault は同期されますが、**同じノートを2台で同時に書き換えると、同期ツールが「〜 (1).md」のような重複ファイルを作ることがあります。** サーバーは同じ名前のノートが複数あると、先に見つかった方を使い、ログに警告を出します。重複ファイルを見つけたら、手で統合してください。
@@ -283,4 +291,5 @@ npm test
 | MCP から vault が空に見える | `MEMORY_DIR` のパス。エージェントが別の clone の古い `dist/index.js` を指していないか |
 | Windows で `node` が見つからない | `command` を node.exe の絶対パスにする |
 | Windows で一部のノートが同期されない | ノート名に `< > : " / \ | ? *` が含まれていないか。パスが長すぎないか（1 の長いパス設定） |
+| `Unknown tool: list_nodes` が出る | MCP が改修版に繋がっていない。起動中のプロセス（`ps aux \| grep obsidian-memory`）と、`~/.claude.json` / `~/.gemini/config/mcp_config.json` の `args` が、このリポジトリの `dist/index.js` を指しているか確認する。直したらエージェントを再起動 |
 | 新しいノートが `00_Inbox` に入る | `entityType` に対して `project` が必要な種類（state / decision など）なのに `project` が無い。`update_entities` で直す |
