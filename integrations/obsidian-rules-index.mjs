@@ -5,12 +5,14 @@
 // (title + first observation) so every session starts with them in context.
 // Full rule text is fetched on demand via the MCP (open_nodes).
 //
-// Vault path: OBSIDIAN_MEMORY_DIR or MEMORY_DIR (same value as the MCP server).
-// Prints nothing (or `{}` with --agy) when the vault is not reachable, so a
-// missing mount never blocks session start.
+// Vault path: --vault <path>, else OBSIDIAN_MEMORY_DIR / MEMORY_DIR (same value
+// as the MCP server). `--vault` keeps the hook command shell-neutral, so the same
+// line works in bash/zsh, PowerShell and cmd (macOS / Linux / Windows).
+// Never writes to stderr and always exits 0; prints nothing (or `{}` with --agy)
+// when the vault is not reachable, so a missing mount never blocks session start.
 //
-//   Claude Code : MEMORY_DIR=... node obsidian-rules-index.mjs
-//   Antigravity : MEMORY_DIR=... node obsidian-rules-index.mjs --agy
+//   Claude Code : node obsidian-rules-index.mjs --vault "<vault>"
+//   Antigravity : node obsidian-rules-index.mjs --agy --vault "<vault>"
 import { promises as fs } from 'fs';
 import path from 'path';
 
@@ -18,9 +20,16 @@ import path from 'path';
 // the vault) followed by the 10_Rules index. Agent-specific instructions live in each
 // agent's own config (~/.claude/CLAUDE.md for Claude Code), never in the policy.
 // --agy: emit Antigravity SessionStart JSON (injectSteps) instead of plain text.
-const AGY = process.argv.includes('--agy');
+const ARGV = process.argv.slice(2);
+const AGY = ARGV.includes('--agy');
+function argValue(name) {
+  const i = ARGV.indexOf(name);
+  if (i !== -1 && ARGV[i + 1] && !ARGV[i + 1].startsWith('--')) return ARGV[i + 1];
+  const eq = ARGV.find(a => a.startsWith(`${name}=`));
+  return eq ? eq.slice(name.length + 1) : undefined;
+}
 
-const VAULT = process.env.OBSIDIAN_MEMORY_DIR || process.env.MEMORY_DIR || '';
+const VAULT = argValue('--vault') || process.env.OBSIDIAN_MEMORY_DIR || process.env.MEMORY_DIR || '';
 const POLICY_FILE = path.join(VAULT, '_system', 'agent-memory-policy.md');
 
 async function sharedPolicy() {
@@ -110,4 +119,6 @@ async function main() {
   await emit(out.join('\n'));
 }
 
-main().catch(() => { if (AGY) process.stdout.write('{}'); });
+main()
+  .catch(() => { if (AGY) process.stdout.write('{}'); })
+  .finally(() => { process.exitCode = 0; });

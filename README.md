@@ -129,38 +129,20 @@ It prints nothing (`{}` with `--agy`) when the vault is unreachable, so it never
 Agent-specific instructions stay in each agent's own file — e.g. `~/.claude/CLAUDE.md`
 (template: [`templates/CLAUDE.md`](templates/CLAUDE.md)) — and are never injected into the other agent.
 
-Claude Code (`~/.claude/settings.json`):
+Register the same script in both agents and pass the vault with `--vault`, so the command is
+shell-neutral (bash/zsh, PowerShell, cmd):
 
-```json
-{
-  "hooks": {
-    "SessionStart": [{
-      "hooks": [{
-        "type": "command",
-        "command": "MEMORY_DIR='/path/to/vault' node /full/path/to/obsidian-memory-mcp/integrations/obsidian-rules-index.mjs 2>/dev/null || true",
-        "timeout": 15
-      }]
-    }]
-  }
-}
-```
+- Claude Code (`~/.claude/settings.json`, exec form — no shell involved):
+  `{"type": "command", "command": "node", "args": ["/path/to/obsidian-memory-mcp/integrations/obsidian-rules-index.mjs", "--vault", "/path/to/vault"], "timeout": 15}`
+- Antigravity (`~/.gemini/config/hooks.json`, adds `--agy` to emit `{"injectSteps":[...]}`):
+  `"command": "\"node\" \"/path/to/obsidian-memory-mcp/integrations/obsidian-rules-index.mjs\" --agy --vault \"/path/to/vault\""`
 
-Antigravity (`~/.gemini/config/hooks.json`) — same script with `--agy`, which emits
-`{"injectSteps":[{"systemMessage":{...}}]}`:
-
-```json
-{
-  "obsidian-rules-index": {
-    "SessionStart": [{
-      "type": "command",
-      "command": "MEMORY_DIR='/path/to/vault' node /full/path/to/obsidian-memory-mcp/integrations/obsidian-rules-index.mjs --agy 2>/dev/null || echo '{}'",
-      "timeout": 15
-    }]
-  }
-}
-```
+**See [docs/INSTALL.md](docs/INSTALL.md) for the full setup (macOS / Windows, Claude Code /
+Antigravity, MCP registration, hooks, templates, verification and troubleshooting).**
 
 ## Installation & Configuration
+
+Step-by-step guide for macOS and Windows: [docs/INSTALL.md](docs/INSTALL.md) (Japanese).
 
 
 ```bash

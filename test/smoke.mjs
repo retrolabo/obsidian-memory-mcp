@@ -109,7 +109,12 @@ try {
   assert(agy.injectSteps[0].systemMessage.systemMessage.includes('- Old rule'));
   const none = execFileSync('node', [hook, '--agy'], { env: { PATH: process.env.PATH } }).toString();
   assert.equal(none, '{}');
-  ok('session-start hook output (plain, --agy, no vault)');
+  const bare = { PATH: process.env.PATH };
+  const viaArg = JSON.parse(execFileSync('node', [hook, '--agy', '--vault', V], { env: bare }).toString());
+  assert(viaArg.injectSteps[0].systemMessage.systemMessage.includes('# Policy'));
+  assert(execFileSync('node', [hook, `--vault=${V}`], { env: bare }).toString().includes('- Old rule'));
+  assert.equal(execFileSync('node', [hook, '--vault', path.join(V, 'missing')], { env: bare }).toString(), '');
+  ok('session-start hook output (plain, --agy, --vault, no vault)');
 
 
   console.log('\nall passed');
