@@ -20,6 +20,14 @@ interface ParsedMarkdown {
   }>;
 }
 
+/** Today's date (YYYY-MM-DD) in the local time zone, not UTC. */
+export function localDate(d: Date = new Date()): string {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
 /**
  * Parse a markdown file content into structured data
  */
@@ -170,7 +178,7 @@ export function deriveAutoTags(name: string, entityType: string): string[] {
  * Generate markdown content from an entity
  */
 export function generateMarkdown(entity: Entity, relations: Relation[]): string {
-  const now = new Date().toISOString().split('T')[0];
+  const now = localDate();
 
   // Prepare tags: if explicitly provided, use them; otherwise auto-derive
   const tagsSet = new Set<string>();
@@ -229,7 +237,7 @@ export function updateMetadata(content: string, updates: Partial<MarkdownMetadat
   const updatedData = { ...parsed.data, ...updates };
   
   // Update the 'updated' timestamp
-  updatedData.updated = new Date().toISOString().split('T')[0];
+  updatedData.updated = localDate();
   
   return matter.stringify(parsed.content, updatedData);
 }
@@ -355,7 +363,7 @@ export function mergeFrontmatter(content: string, set: Record<string, any>, remo
     if (v !== undefined) data[k] = v;
   }
   for (const k of remove) delete data[k];
-  data.updated = new Date().toISOString().split('T')[0];
+  data.updated = localDate();
   return matter.stringify(parsed.content, data);
 }
 
