@@ -6,6 +6,8 @@ interface MarkdownMetadata {
   tags?: string[];
   created?: string;
   updated?: string;
+  project?: string;
+  status?: string;
 }
 
 interface ParsedMarkdown {
@@ -38,6 +40,8 @@ export function parseMarkdown(content: string, entityName: string): ParsedMarkdo
     tags,
     created: (parsed.data as any)?.created,
     updated: (parsed.data as any)?.updated,
+    project: (parsed.data as any)?.project ? String((parsed.data as any).project) : undefined,
+    status: (parsed.data as any)?.status ? String((parsed.data as any).status) : undefined,
   };
   
   // Extract observations from the content
@@ -182,6 +186,8 @@ export function generateMarkdown(entity: Entity, relations: Relation[]): string 
     created: entity.created || now,
     updated: now
   };
+  if (entity.project) frontmatter.project = entity.project;
+  if (entity.status) frontmatter.status = entity.status;
 
   if (tagsSet.size > 0) {
     frontmatter.tags = Array.from(tagsSet);
@@ -277,6 +283,80 @@ export function removeRelationFromContent(content: string, relation: Relation): 
   );
   
   return content.replace(linkPattern, '');
+}
+
+/** Locate the Observations section: [headerIndex, endIndexExclusive] or null. */
+function findSection(lines: string[], names: string[]): [number, number] | null {
+  let start = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const t = lines[i].trim();
+    if (start === -1) {
+      if (names.some(n => t === `## ${n}` || t === `### ${n}`)) start = i;
+    } else if (/^#{1,6}\s/.test(t)) {
+      return [start, i];
+    }
+  }
+  return start === -1 ? null : [start, lines.length];
+}
+
+/**
+ * Append observation bullets to the Observations section in place, keeping every
+ * other section (and the frontmatter) untouched. Creates the section if missing,
+ * right before "## Relations" when that exists.
+ */
+export function appendObservationsToContent(content: string, observations: string[]): string {
+  if (observations.length === 0) return content;
+  const lines = content.split('\n');
+  const bullets = observations.map(o => `- ${o}`);
+  const sec = findSection(lines, ['Observations']);
+  if (sec) {
+    let last = sec[0];
+    for (let i = sec[0] + 1; i < sec[1]; i++) {
+      if (lines[i].trim() !== '') last = i;
+    }
+    lines.splice(last + 1, 0, ...bullets);
+    return lines.join('\n');
+  }
+  const rel = findSection(lines, ['Relations']);
+  if (rel) {
+    lines.splice(rel[0], 0, '## Observations', ...bullets, '');
+    return lines.join('\n');
+  }
+  while (lines.length > 0 && lines[lines.length - 1].trim() === '') lines.pop();
+  lines.push('', '## Observations', ...bullets, '');
+  return lines.join('\n');
+}
+
+/** Remove matching observation bullets from the Observations section in place. */
+export function removeObservationsFromContent(content: string, observations: string[]): string {
+  const targets = new Set(observations);
+  const lines = content.split('\n');
+  const sec = findSection(lines, ['Observations']);
+  if (!sec) return content;
+  const kept: string[] = [];
+  lines.forEach((line, i) => {
+    if (i > sec[0] && i < sec[1]) {
+      const t = line.trim();
+      if ((t.startsWith('- ') || t.startsWith('* ')) && targets.has(t.substring(2))) return;
+    }
+    kept.push(line);
+  });
+  return kept.join('\n');
+}
+
+/**
+ * Merge frontmatter fields (null/undefined-valued keys in `remove` are deleted)
+ * and bump `updated`, preserving the body and any frontmatter keys we don't own.
+ */
+export function mergeFrontmatter(content: string, set: Record<string, any>, remove: string[] = []): string {
+  const parsed = matter(content);
+  const data: Record<string, any> = { ...(parsed.data as Record<string, any>) };
+  for (const [k, v] of Object.entries(set)) {
+    if (v !== undefined) data[k] = v;
+  }
+  for (const k of remove) delete data[k];
+  data.updated = new Date().toISOString().split('T')[0];
+  return matter.stringify(parsed.content, data);
 }
 
 function escapeRegExp(string: string): string {

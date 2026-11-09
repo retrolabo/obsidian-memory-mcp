@@ -15,7 +15,8 @@
         "index.ts",
         "types.ts",
         "utils/**/*.ts",
-        "storage/**/*.ts"
+        "storage/**/*.ts",
+        "scripts/**/*.ts"
     ],
     "exclude": [
         "node_modules"

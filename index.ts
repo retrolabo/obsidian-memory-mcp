@@ -6,12 +6,38 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { Entity, Relation } from './types.js';
+import { Entity, Relation, NodeFilter, UpdateEntityParams } from './types.js';
 import { MarkdownStorageManager } from './storage/MarkdownStorageManager.js';
 
 // Create Markdown storage manager
 const storageManager = new MarkdownStorageManager();
 
+
+const LAYOUT_GUIDE = `Notes are placed automatically by entityType + project:
+- rule / feedback / user -> 10_Rules (always-load behaviour rules)
+- state / handoff / todo -> 20_Projects/<project>/state (overwrite-style current status)
+- decision / design / policy -> 20_Projects/<project>/decisions (mark old ones status=superseded)
+- tip / antipattern / reference -> 30_Knowledge/{tips,antipatterns,reference} when cross-project (omit project),
+  or 20_Projects/<project>/notes when it only makes sense for that project
+- project / note / other -> 20_Projects/<project>/notes
+- session -> 40_Sessions/YYYY/YYYY-MM, daily -> 50_Daily, index -> _system
+- anything without a project that needs one -> 00_Inbox
+Rule of thumb: if the note still makes sense with the project name removed, omit project.
+Names must be unique across the whole vault (Obsidian links by name).`;
+
+const FILTER_PROPS = {
+  folder: { type: "string", description: "Vault-relative folder prefix, e.g. '10_Rules', '20_Projects/reton', '30_Knowledge/antipatterns'" },
+  entityType: { type: "string", description: "Exact entityType (case-insensitive)" },
+  project: { type: "string", description: "Project slug, e.g. 'reton'" },
+  status: { type: "string", description: "Status, e.g. 'active' (notes without status count as active) or 'superseded'" },
+  tag: { type: "string", description: "Tag (matches the tag itself and its children, e.g. 'project' matches 'project/reton')" },
+  includeArchived: { type: "boolean", description: "Include notes in 90_Archive (default false)" },
+};
+
+const pickFilter = (a: any): NodeFilter => ({
+  folder: a?.folder, entityType: a?.entityType, project: a?.project,
+  status: a?.status, tag: a?.tag, includeArchived: a?.includeArchived,
+});
 
 // The server instance and tools exposed to Claude
 const server = new Server({
@@ -28,7 +54,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
     tools: [
       {
         name: "create_entities",
-        description: "Create multiple new entities in the knowledge graph",
+        description: `Create multiple new entities (notes) in the knowledge graph.\n${LAYOUT_GUIDE}`,
         inputSchema: {
           type: "object",
           properties: {
@@ -49,6 +75,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
                     items: { type: "string" },
                     description: "Optional tags for the entity (e.g. ['project/smb', 'tips', 'session'])"
                   },
+                  project: { type: "string", description: "Project slug (e.g. 'reton'). Decides the 20_Projects/<project>/ folder. Falls back to the first project/<x> tag." },
+                  status: { type: "string", description: "Optional status, e.g. 'active' or 'superseded'" },
+                  folder: { type: "string", description: "Optional vault-relative folder that overrides automatic placement" },
                 },
                 required: ["name", "entityType", "observations"],
               },
@@ -169,10 +198,10 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
       },
       {
         name: "read_graph",
-        description: "Read the entire knowledge graph",
+        description: "Read the knowledge graph (optionally filtered by folder / entityType / project / status / tag). Archived notes are excluded unless includeArchived is true.",
         inputSchema: {
           type: "object",
-          properties: {},
+          properties: { ...FILTER_PROPS },
         },
       },
       {
@@ -181,7 +210,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         inputSchema: {
           type: "object",
           properties: {
-            query: { type: "string", description: "The search query to match against entity names, types, and observation content" },
+            query: { type: "string", description: "The search query to match against entity names, types, tags, project and observation content (empty string = filters only)" },
+            ...FILTER_PROPS,
           },
           required: ["query"],
         },
@@ -202,6 +232,40 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
         },
       },
       {
+        name: "list_nodes",
+        description: "List notes without their observations (name, entityType, project, status, tags, updated, path). Use it to decide what to open, e.g. folder='10_Rules' at session start or project='reton' when resuming a project.",
+        inputSchema: {
+          type: "object",
+          properties: { ...FILTER_PROPS },
+        },
+      },
+      {
+        name: "update_entities",
+        description: `Update note metadata (entityType / project / status / tags) and/or move notes between folders. Changing entityType or project relocates the note to its new automatic folder unless relocate=false. Pass folder to move explicitly (e.g. '90_Archive' or '30_Knowledge/antipatterns'). Links keep working since Obsidian resolves by name.\n${LAYOUT_GUIDE}`,
+        inputSchema: {
+          type: "object",
+          properties: {
+            updates: {
+              type: "array",
+              items: {
+                type: "object",
+                properties: {
+                  name: { type: "string", description: "Entity name" },
+                  entityType: { type: "string" },
+                  project: { type: ["string", "null"], description: "New project slug; null or '' removes it" },
+                  status: { type: ["string", "null"], description: "New status; null or '' removes it" },
+                  tags: { type: "array", items: { type: "string" }, description: "Replace tags" },
+                  folder: { type: "string", description: "Vault-relative destination folder" },
+                  relocate: { type: "boolean", description: "Recompute folder from entityType/project and move (default: true when entityType or project changes)" },
+                },
+                required: ["name"],
+              },
+            },
+          },
+          required: ["updates"],
+        },
+      },
+      {
         name: "create_session_moc",
         description: "Create a structured Session MOC (Map of Content) note in Obsidian, automatically link it to the previous session, link related topics/entities, and prepend to Sessions Index.md",
         inputSchema: {
@@ -215,7 +279,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             tips: { type: "array", items: { type: "string" }, description: "List of tips, insights, or pitfalls discovered" },
             relatedEntities: { type: "array", items: { type: "string" }, description: "Names of entities to include in the Map of Content" },
             nextSteps: { type: "array", items: { type: "string" }, description: "Next steps or carry-overs for subsequent sessions" },
-            tags: { type: "array", items: { type: "string" }, description: "Optional extra tags (e.g. ['project/smb'])" }
+            tags: { type: "array", items: { type: "string" }, description: "Optional extra tags (e.g. ['project/smb'])" },
+            project: { type: "string", description: "Optional project slug; adds project frontmatter, project/<x> tag and a link to the project hub note" }
           },
           required: ["title", "overview"],
         },
@@ -234,7 +299,8 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
             tips: { type: "array", items: { type: "string" }, description: "List of tips, insights, or pitfalls discovered" },
             relatedEntities: { type: "array", items: { type: "string" }, description: "Names of entities to include in the Map of Content" },
             nextSteps: { type: "array", items: { type: "string" }, description: "Next steps or carry-overs for subsequent sessions" },
-            tags: { type: "array", items: { type: "string" }, description: "Optional extra tags (e.g. ['project/smb'])" }
+            tags: { type: "array", items: { type: "string" }, description: "Optional extra tags (e.g. ['project/smb'])" },
+            project: { type: "string", description: "Optional project slug; adds project frontmatter, project/<x> tag and a link to the project hub note" }
           },
           required: ["title", "overview"],
         },
@@ -244,11 +310,9 @@ server.setRequestHandler(ListToolsRequestSchema, async () => {
 });
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
-  const { name, arguments: args } = request.params;
+  const { name } = request.params;
 
-  if (!args) {
-    throw new Error(`No arguments provided for tool: ${name}`);
-  }
+  const args = (request.params.arguments || {}) as Record<string, any>;
 
   switch (name) {
     case "create_entities":
@@ -267,11 +331,15 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       await storageManager.deleteRelations(args.relations as Relation[]);
       return { content: [{ type: "text", text: "Relations deleted successfully" }] };
     case "read_graph":
-      return { content: [{ type: "text", text: JSON.stringify(await storageManager.readGraph(), null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(await storageManager.readGraph(pickFilter(args)), null, 2) }] };
     case "search_nodes":
-      return { content: [{ type: "text", text: JSON.stringify(await storageManager.searchNodes(args.query as string), null, 2) }] };
+      return { content: [{ type: "text", text: JSON.stringify(await storageManager.searchNodes(args.query as string, pickFilter(args)), null, 2) }] };
     case "open_nodes":
       return { content: [{ type: "text", text: JSON.stringify(await storageManager.openNodes(args.names as string[]), null, 2) }] };
+    case "list_nodes":
+      return { content: [{ type: "text", text: JSON.stringify(await storageManager.listNodes(pickFilter(args)), null, 2) }] };
+    case "update_entities":
+      return { content: [{ type: "text", text: JSON.stringify(await storageManager.updateEntities(args.updates as UpdateEntityParams[]), null, 2) }] };
     case "create_session_moc":
     case "create_session":
       return { content: [{ type: "text", text: JSON.stringify(await storageManager.createSessionMoc(args as any), null, 2) }] };
