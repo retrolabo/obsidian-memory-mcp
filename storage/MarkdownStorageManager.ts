@@ -1,20 +1,44 @@
 import { promises as fs } from 'fs';
 import path from 'path';
 import matter from 'gray-matter';
-import { Entity, Relation, KnowledgeGraph, CreateSessionMocParams } from '../types.js';
-import { 
-  getMemoryDir, 
-  getEntityPath, 
+import {
+  Entity,
+  Relation,
+  KnowledgeGraph,
+  CreateSessionMocParams,
+  NodeFilter,
+  NodeSummary,
+  UpdateEntityParams,
+} from '../types.js';
+import {
+  getMemoryDir,
   getEntityNameFromPath,
-  sanitizeFilename 
+  sanitizeFilename
 } from '../utils/pathUtils.js';
-import { 
-  parseMarkdown, 
+import {
+  parseMarkdown,
   generateMarkdown,
-  updateMetadata,
   addRelationToContent,
-  removeRelationFromContent
+  removeRelationFromContent,
+  appendObservationsToContent,
+  removeObservationsFromContent,
+  mergeFrontmatter,
 } from '../utils/markdownUtils.js';
+import {
+  FOLDERS,
+  IGNORED_DIRS,
+  normalizeProject,
+  projectFromTags,
+  resolveFolder,
+  sanitizeRelativeFolder,
+} from '../utils/layout.js';
+
+interface LoadedNote {
+  entity: Entity;
+  relations: Relation[];
+}
+
+const SESSIONS_INDEX = 'Sessions Index';
 
 export class MarkdownStorageManager {
   private memoryDir: string;
@@ -23,234 +47,248 @@ export class MarkdownStorageManager {
     this.memoryDir = getMemoryDir();
   }
 
-  /**
-   * Ensure the memory directory exists
-   */
-  private async ensureMemoryDir(): Promise<void> {
+  // ---------------------------------------------------------------------------
+  // Paths & index
+  // ---------------------------------------------------------------------------
+
+  private async ensureDir(dir: string): Promise<void> {
     try {
-      await fs.mkdir(this.memoryDir, { recursive: true });
+      await fs.mkdir(dir, { recursive: true });
     } catch (error) {
-      throw new Error(`Failed to create memory directory: ${error}`);
+      throw new Error(`Failed to create directory ${dir}: ${error}`);
     }
   }
 
-  /**
-   * Load a single entity from a markdown file
-   */
-  private async loadEntity(filePath: string): Promise<Entity | null> {
-    try {
-      const content = await fs.readFile(filePath, 'utf-8');
-      const entityName = getEntityNameFromPath(filePath);
-      if (!entityName) return null;
+  private rel(absPath: string): string {
+    return path.relative(this.memoryDir, absPath).split(path.sep).join('/');
+  }
 
-      const parsed = parseMarkdown(content, entityName);
-      return {
-        name: entityName,
-        entityType: parsed.metadata.entityType || 'unknown',
-        observations: parsed.observations,
-        tags: parsed.metadata.tags || [],
-        created: parsed.metadata.created
-      };
-    } catch (error) {
-      if (error instanceof Error && 'code' in error && (error as any).code === 'ENOENT') {
-        return null;
+  /**
+   * Walk the vault recursively and map entity name (file basename) -> absolute path.
+   * Obsidian resolves [[links]] by basename, so names are the unique key across folders.
+   */
+  private async buildIndex(): Promise<Map<string, string>> {
+    await this.ensureDir(this.memoryDir);
+    const index = new Map<string, string>();
+    const ignored = new Set(IGNORED_DIRS);
+
+    const walk = async (dir: string): Promise<void> => {
+      let dirents;
+      try {
+        dirents = await fs.readdir(dir, { withFileTypes: true });
+      } catch (error) {
+        throw new Error(`Failed to read directory ${dir}: ${error}`);
       }
+      // Sort so that duplicate resolution is deterministic (shallower/alphabetical first).
+      dirents.sort((a, b) => a.name.localeCompare(b.name));
+      const subdirs: string[] = [];
+      for (const d of dirents) {
+        if (d.name.startsWith('.')) continue;
+        const abs = path.join(dir, d.name);
+        if (d.isDirectory()) {
+          const r = this.rel(abs);
+          if (ignored.has(r) || ignored.has(d.name)) continue;
+          subdirs.push(abs);
+        } else if (d.isFile() && d.name.endsWith('.md')) {
+          const name = getEntityNameFromPath(abs);
+          if (!name) continue;
+          if (index.has(name)) {
+            console.error(`[obsidian-memory] duplicate note name "${name}": using ${this.rel(index.get(name)!)}, ignoring ${this.rel(abs)}`);
+            continue;
+          }
+          index.set(name, abs);
+        }
+      }
+      for (const s of subdirs) await walk(s);
+    };
+
+    await walk(this.memoryDir);
+    return index;
+  }
+
+  private async resolvePath(name: string, index?: Map<string, string>): Promise<string | undefined> {
+    const idx = index || await this.buildIndex();
+    return idx.get(name) ?? idx.get(sanitizeFilename(name));
+  }
+
+  private async requirePath(name: string, index?: Map<string, string>): Promise<string> {
+    const p = await this.resolvePath(name, index);
+    if (!p) throw new Error(`Entity ${name} not found`);
+    return p;
+  }
+
+  /** Absolute path where a new note named `name` should be written. */
+  private placementPath(name: string, folder: string): string {
+    return path.join(this.memoryDir, folder, `${sanitizeFilename(name)}.md`);
+  }
+
+  private folderFor(entity: { name: string; entityType?: string; project?: string; folder?: string }): string {
+    if (entity.folder !== undefined && entity.folder !== null) {
+      return sanitizeRelativeFolder(entity.folder);
+    }
+    return resolveFolder({ name: entity.name, entityType: entity.entityType, project: entity.project });
+  }
+
+  // ---------------------------------------------------------------------------
+  // Loading
+  // ---------------------------------------------------------------------------
+
+  private async loadNote(filePath: string): Promise<LoadedNote | null> {
+    let content: string;
+    try {
+      content = await fs.readFile(filePath, 'utf-8');
+    } catch (error) {
+      if (error instanceof Error && 'code' in error && (error as any).code === 'ENOENT') return null;
       throw error;
     }
+    const entityName = getEntityNameFromPath(filePath);
+    if (!entityName) return null;
+
+    const parsed = parseMarkdown(content, entityName);
+    const tags = parsed.metadata.tags || [];
+    const entity: Entity = {
+      name: entityName,
+      entityType: parsed.metadata.entityType || 'unknown',
+      observations: parsed.observations,
+      tags,
+      created: parsed.metadata.created,
+      updated: parsed.metadata.updated,
+      project: normalizeProject(parsed.metadata.project) || projectFromTags(tags),
+      status: parsed.metadata.status,
+      path: this.rel(filePath),
+    };
+    const relations = parsed.relations.map(r => ({ from: entityName, to: r.to, relationType: r.relationType }));
+    return { entity, relations };
   }
 
-  /**
-   * Load all entities from the memory directory
-   */
-  private async loadAllEntities(): Promise<Entity[]> {
-    await this.ensureMemoryDir();
-    
+  private async loadAll(index?: Map<string, string>): Promise<LoadedNote[]> {
+    const idx = index || await this.buildIndex();
     try {
-      const files = await fs.readdir(this.memoryDir);
-      const mdFiles = files.filter(f => f.endsWith('.md'));
-      
-      const entities = await Promise.all(
-        mdFiles.map(file => this.loadEntity(path.join(this.memoryDir, file)))
-      );
-      
-      return entities.filter((e): e is Entity => e !== null);
+      const notes = await Promise.all([...idx.values()].map(p => this.loadNote(p)));
+      return notes.filter((n): n is LoadedNote => n !== null);
     } catch (error) {
       throw new Error(`Failed to load entities: ${error}`);
     }
   }
 
-  /**
-   * Load all relations from all markdown files
-   */
-  private async loadAllRelations(): Promise<Relation[]> {
-    await this.ensureMemoryDir();
-    
-    try {
-      const files = await fs.readdir(this.memoryDir);
-      const mdFiles = files.filter(f => f.endsWith('.md'));
-      
-      const allRelations: Relation[] = [];
-      
-      for (const file of mdFiles) {
-        const filePath = path.join(this.memoryDir, file);
-        const content = await fs.readFile(filePath, 'utf-8');
-        const entityName = getEntityNameFromPath(filePath);
-        if (!entityName) continue;
-        
-        const parsed = parseMarkdown(content, entityName);
-        
-        for (const rel of parsed.relations) {
-          allRelations.push({
-            from: entityName,
-            to: rel.to,
-            relationType: rel.relationType
-          });
-        }
-      }
-      
-      return allRelations;
-    } catch (error) {
-      throw new Error(`Failed to load relations: ${error}`);
-    }
-  }
-
-  /**
-   * Save an entity to a markdown file
-   */
-  private async saveEntity(entity: Entity, relations: Relation[]): Promise<void> {
-    await this.ensureMemoryDir();
-    
-    const filePath = getEntityPath(entity.name);
-    const content = generateMarkdown(entity, relations);
-    
-    try {
-      await fs.writeFile(filePath, content, 'utf-8');
-    } catch (error) {
-      throw new Error(`Failed to save entity ${entity.name}: ${error}`);
-    }
-  }
-
-  /**
-   * Load the entire knowledge graph
-   */
   async loadGraph(): Promise<KnowledgeGraph> {
-    const [entities, relations] = await Promise.all([
-      this.loadAllEntities(),
-      this.loadAllRelations()
-    ]);
-    
-    return { entities, relations };
+    const notes = await this.loadAll();
+    return {
+      entities: notes.map(n => n.entity),
+      relations: notes.flatMap(n => n.relations),
+    };
   }
 
-  /**
-   * Create new entities
-   */
-  async createEntities(entities: Entity[]): Promise<Entity[]> {
-    const graph = await this.loadGraph();
-    const newEntities: Entity[] = [];
-    
-    for (const entity of entities) {
-      // Check if entity already exists
-      if (graph.entities.some(e => e.name === entity.name)) {
-        continue;
-      }
-      
-      // Save the entity
-      await this.saveEntity(entity, []);
-      newEntities.push(entity);
+  private matchesFilter(e: Entity, f: NodeFilter = {}): boolean {
+    const p = e.path || '';
+    if (!f.includeArchived && (p === FOLDERS.archive || p.startsWith(`${FOLDERS.archive}/`))) {
+      // An explicit folder filter pointing into the archive wins.
+      if (!(f.folder && sanitizeRelativeFolder(f.folder).startsWith(FOLDERS.archive))) return false;
     }
-    
-    return newEntities;
+    if (f.folder) {
+      const folder = sanitizeRelativeFolder(f.folder);
+      if (folder && !(p.startsWith(`${folder}/`))) return false;
+    }
+    if (f.entityType && e.entityType.toLowerCase() !== f.entityType.toLowerCase()) return false;
+    if (f.project && e.project !== normalizeProject(f.project)) return false;
+    if (f.status && (e.status || 'active').toLowerCase() !== f.status.toLowerCase()) return false;
+    if (f.tag) {
+      const tag = f.tag.replace(/^#/, '').toLowerCase();
+      if (!(e.tags || []).some(t => t.toLowerCase() === tag || t.toLowerCase().startsWith(`${tag}/`))) return false;
+    }
+    return true;
   }
 
-  /**
-   * Create new relations and update both source and target files
-   */
+  private subgraph(graph: KnowledgeGraph, entities: Entity[]): KnowledgeGraph {
+    const names = new Set(entities.map(e => e.name));
+    return {
+      entities,
+      relations: graph.relations.filter(r => names.has(r.from) && names.has(r.to)),
+    };
+  }
+
+  // ---------------------------------------------------------------------------
+  // Entities
+  // ---------------------------------------------------------------------------
+
+  async createEntities(entities: Entity[]): Promise<Entity[]> {
+    const index = await this.buildIndex();
+    const created: Entity[] = [];
+
+    for (const input of entities) {
+      if (await this.resolvePath(input.name, index)) continue;
+
+      const project = normalizeProject(input.project) || projectFromTags(input.tags);
+      const entity: Entity = { ...input, project };
+      const folder = this.folderFor(entity);
+      const filePath = this.placementPath(entity.name, folder);
+
+      await this.ensureDir(path.dirname(filePath));
+      try {
+        await fs.writeFile(filePath, generateMarkdown(entity, []), { encoding: 'utf-8', flag: 'wx' });
+      } catch (error) {
+        throw new Error(`Failed to save entity ${entity.name}: ${error}`);
+      }
+      index.set(entity.name, filePath);
+
+      const { folder: _ignored, ...rest } = entity;
+      created.push({ ...rest, path: this.rel(filePath) });
+    }
+
+    return created;
+  }
+
   async createRelations(relations: Relation[]): Promise<Relation[]> {
+    const index = await this.buildIndex();
     const graph = await this.loadGraph();
     const newRelations: Relation[] = [];
-    
+
     for (const relation of relations) {
-      // Check if relation already exists
-      const exists = graph.relations.some(r => 
-        r.from === relation.from && 
-        r.to === relation.to && 
-        r.relationType === relation.relationType
+      const exists = graph.relations.some(r =>
+        r.from === relation.from && r.to === relation.to && r.relationType === relation.relationType
       );
-      
       if (exists) continue;
-      
-      // Update the source entity file
-      const fromPath = getEntityPath(relation.from);
-      try {
-        const content = await fs.readFile(fromPath, 'utf-8');
-        const updatedContent = addRelationToContent(content, relation);
-        await fs.writeFile(fromPath, updatedContent, 'utf-8');
-        
-        newRelations.push(relation);
-      } catch (error) {
-        if (error instanceof Error && 'code' in error && (error as any).code === 'ENOENT') {
-          throw new Error(`Entity ${relation.from} not found`);
-        }
-        throw error;
-      }
+
+      const fromPath = await this.requirePath(relation.from, index);
+      const content = await fs.readFile(fromPath, 'utf-8');
+      await fs.writeFile(fromPath, addRelationToContent(content, relation), 'utf-8');
+      graph.relations.push(relation);
+      newRelations.push(relation);
     }
-    
+
     return newRelations;
   }
 
-  /**
-   * Add observations to existing entities
-   */
+  /** Appends observations in place: other sections of the note are preserved. */
   async addObservations(observations: { entityName: string; contents: string[] }[]): Promise<{ entityName: string; addedObservations: string[] }[]> {
+    const index = await this.buildIndex();
     const results: { entityName: string; addedObservations: string[] }[] = [];
-    
+
     for (const obs of observations) {
-      const entityPath = getEntityPath(obs.entityName);
-      
       try {
-        // Load current entity
-        const entity = await this.loadEntity(entityPath);
-        if (!entity) {
-          throw new Error(`Entity ${obs.entityName} not found`);
-        }
-        
-        // Filter out duplicate observations
-        const newObservations = obs.contents.filter(
-          content => !entity.observations.includes(content)
-        );
-        
-        if (newObservations.length > 0) {
-          // Update entity
-          entity.observations.push(...newObservations);
-          
-          // Get current relations for this entity
-          const graph = await this.loadGraph();
-          const entityRelations = graph.relations.filter(r => r.from === entity.name);
-          
-          // Save updated entity
-          await this.saveEntity(entity, entityRelations);
-          
-          results.push({
-            entityName: obs.entityName,
-            addedObservations: newObservations
-          });
-        }
+        const filePath = await this.requirePath(obs.entityName, index);
+        const content = await fs.readFile(filePath, 'utf-8');
+        const existing = new Set(parseMarkdown(content, obs.entityName).observations);
+        const fresh = [...new Set(obs.contents)].filter(c => !existing.has(c));
+        if (fresh.length === 0) continue;
+
+        const updated = mergeFrontmatter(appendObservationsToContent(content, fresh), {});
+        await fs.writeFile(filePath, updated, 'utf-8');
+        results.push({ entityName: obs.entityName, addedObservations: fresh });
       } catch (error) {
         throw new Error(`Failed to add observations to ${obs.entityName}: ${error}`);
       }
     }
-    
+
     return results;
   }
 
-  /**
-   * Delete entities and their files
-   */
   async deleteEntities(entityNames: string[]): Promise<void> {
+    const index = await this.buildIndex();
+
     for (const name of entityNames) {
-      const filePath = getEntityPath(name);
-      
+      const filePath = await this.resolvePath(name, index);
+      if (!filePath) continue;
       try {
         await fs.unlink(filePath);
       } catch (error) {
@@ -258,137 +296,164 @@ export class MarkdownStorageManager {
           throw new Error(`Failed to delete entity ${name}: ${error}`);
         }
       }
+      index.delete(name);
     }
-    
+
     // Remove relations pointing to deleted entities
-    const remainingRelations = await this.loadAllRelations();
-    const relationsToRemove = remainingRelations.filter(
-      r => entityNames.includes(r.to)
-    );
-    
-    for (const relation of relationsToRemove) {
-      const fromPath = getEntityPath(relation.from);
-      try {
-        const content = await fs.readFile(fromPath, 'utf-8');
-        const updatedContent = removeRelationFromContent(content, relation);
-        await fs.writeFile(fromPath, updatedContent, 'utf-8');
-      } catch (error) {
-        // Entity might have been deleted
-      }
+    const notes = await this.loadAll(index);
+    const targets = new Set(entityNames);
+    for (const note of notes) {
+      const toRemove = note.relations.filter(r => targets.has(r.to));
+      if (toRemove.length === 0) continue;
+      const filePath = index.get(note.entity.name)!;
+      let content = await fs.readFile(filePath, 'utf-8');
+      for (const r of toRemove) content = removeRelationFromContent(content, r);
+      await fs.writeFile(filePath, content, 'utf-8');
     }
   }
 
-  /**
-   * Delete specific observations from entities
-   */
   async deleteObservations(deletions: { entityName: string; observations: string[] }[]): Promise<void> {
+    const index = await this.buildIndex();
+
     for (const del of deletions) {
-      const entityPath = getEntityPath(del.entityName);
-      
+      const filePath = await this.resolvePath(del.entityName, index);
+      if (!filePath) continue;
       try {
-        const entity = await this.loadEntity(entityPath);
-        if (!entity) continue;
-        
-        // Remove specified observations
-        entity.observations = entity.observations.filter(
-          obs => !del.observations.includes(obs)
-        );
-        
-        // Get current relations
-        const graph = await this.loadGraph();
-        const entityRelations = graph.relations.filter(r => r.from === entity.name);
-        
-        // Save updated entity
-        await this.saveEntity(entity, entityRelations);
+        const content = await fs.readFile(filePath, 'utf-8');
+        const next = removeObservationsFromContent(content, del.observations);
+        if (next === content) continue;
+        await fs.writeFile(filePath, mergeFrontmatter(next, {}), 'utf-8');
       } catch (error) {
         throw new Error(`Failed to delete observations from ${del.entityName}: ${error}`);
       }
     }
   }
 
-  /**
-   * Delete relations
-   */
   async deleteRelations(relations: Relation[]): Promise<void> {
+    const index = await this.buildIndex();
+
     for (const relation of relations) {
-      const fromPath = getEntityPath(relation.from);
-      
-      try {
-        const content = await fs.readFile(fromPath, 'utf-8');
-        const updatedContent = removeRelationFromContent(content, relation);
-        await fs.writeFile(fromPath, updatedContent, 'utf-8');
-      } catch (error) {
-        if (error instanceof Error && 'code' in error && (error as any).code !== 'ENOENT') {
-          throw new Error(`Failed to delete relation from ${relation.from}: ${error}`);
-        }
-      }
+      const fromPath = await this.resolvePath(relation.from, index);
+      if (!fromPath) continue;
+      const content = await fs.readFile(fromPath, 'utf-8');
+      await fs.writeFile(fromPath, removeRelationFromContent(content, relation), 'utf-8');
     }
   }
 
   /**
-   * Read the entire graph
+   * Update frontmatter (entityType / project / status / tags) and optionally move
+   * the note to another folder. Links keep working because Obsidian resolves by name.
    */
-  async readGraph(): Promise<KnowledgeGraph> {
-    return this.loadGraph();
+  async updateEntities(updates: UpdateEntityParams[]): Promise<{ name: string; path: string; moved: boolean }[]> {
+    const index = await this.buildIndex();
+    const results: { name: string; path: string; moved: boolean }[] = [];
+
+    for (const u of updates) {
+      const filePath = await this.requirePath(u.name, index);
+      let content = await fs.readFile(filePath, 'utf-8');
+
+      const set: Record<string, any> = {};
+      const remove: string[] = [];
+      if (u.entityType !== undefined) set.entityType = u.entityType;
+      if (u.project !== undefined) {
+        const p = normalizeProject(u.project);
+        if (p) set.project = p; else remove.push('project');
+      }
+      if (u.status !== undefined) {
+        if (u.status) set.status = u.status; else remove.push('status');
+      }
+      if (u.tags !== undefined) set.tags = u.tags.map(t => t.trim().replace(/^#/, '')).filter(Boolean);
+
+      if (Object.keys(set).length > 0 || remove.length > 0) {
+        content = mergeFrontmatter(content, set, remove);
+        await fs.writeFile(filePath, content, 'utf-8');
+      }
+
+      let target = filePath;
+      const relocate = u.folder !== undefined
+        || (u.relocate ?? (u.entityType !== undefined || u.project !== undefined));
+      if (relocate) {
+        const loaded = await this.loadNote(filePath);
+        const folder = this.folderFor({
+          name: u.name,
+          entityType: loaded?.entity.entityType,
+          project: loaded?.entity.project,
+          folder: u.folder,
+        });
+        target = path.join(this.memoryDir, folder, path.basename(filePath));
+        if (path.resolve(target) !== path.resolve(filePath)) {
+          try {
+            await fs.access(target);
+            throw new Error(`Cannot move ${u.name}: ${this.rel(target)} already exists`);
+          } catch (error) {
+            if (!(error instanceof Error && 'code' in error && (error as any).code === 'ENOENT')) throw error;
+          }
+          await this.ensureDir(path.dirname(target));
+          await fs.rename(filePath, target);
+          index.set(u.name, target);
+        }
+      }
+
+      results.push({ name: u.name, path: this.rel(target), moved: target !== filePath });
+    }
+
+    return results;
   }
 
-  /**
-   * Search nodes based on query
-   */
-  async searchNodes(query: string): Promise<KnowledgeGraph> {
+  // ---------------------------------------------------------------------------
+  // Queries
+  // ---------------------------------------------------------------------------
+
+  async readGraph(filter: NodeFilter = {}): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
-    const queryLower = query.toLowerCase();
-    
-    // Filter entities
-    const filteredEntities = graph.entities.filter(e => 
-      e.name.toLowerCase().includes(queryLower) ||
-      e.entityType.toLowerCase().includes(queryLower) ||
-      (e.tags && e.tags.some(t => t.toLowerCase().includes(queryLower))) ||
-      e.observations.some(o => o.toLowerCase().includes(queryLower))
-    );
-    
-    // Get filtered entity names
-    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
-    
-    // Filter relations to only include those between filtered entities
-    const filteredRelations = graph.relations.filter(r => 
-      filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to)
-    );
-    
-    return {
-      entities: filteredEntities,
-      relations: filteredRelations
-    };
+    return this.subgraph(graph, graph.entities.filter(e => this.matchesFilter(e, filter)));
   }
 
-  /**
-   * Open specific nodes by name
-   */
+  async searchNodes(query: string, filter: NodeFilter = {}): Promise<KnowledgeGraph> {
+    const graph = await this.loadGraph();
+    const q = (query || '').toLowerCase();
+
+    const entities = graph.entities.filter(e => this.matchesFilter(e, filter) && (
+      !q ||
+      e.name.toLowerCase().includes(q) ||
+      e.entityType.toLowerCase().includes(q) ||
+      (e.project || '').includes(q) ||
+      (e.tags && e.tags.some(t => t.toLowerCase().includes(q))) ||
+      e.observations.some(o => o.toLowerCase().includes(q))
+    ));
+
+    return this.subgraph(graph, entities);
+  }
+
   async openNodes(names: string[]): Promise<KnowledgeGraph> {
     const graph = await this.loadGraph();
-    
-    // Filter entities
-    const filteredEntities = graph.entities.filter(e => names.includes(e.name));
-    
-    // Get filtered entity names
-    const filteredEntityNames = new Set(filteredEntities.map(e => e.name));
-    
-    // Filter relations
-    const filteredRelations = graph.relations.filter(r => 
-      filteredEntityNames.has(r.from) && filteredEntityNames.has(r.to)
-    );
-    
-    return {
-      entities: filteredEntities,
-      relations: filteredRelations
-    };
+    return this.subgraph(graph, graph.entities.filter(e => names.includes(e.name)));
   }
 
-  /**
-   * Create a structured Session MOC (Map of Content) note
-   */
+  /** Lightweight listing (no observations) for deciding what to load. */
+  async listNodes(filter: NodeFilter = {}): Promise<NodeSummary[]> {
+    const notes = await this.loadAll();
+    return notes
+      .map(n => n.entity)
+      .filter(e => this.matchesFilter(e, filter))
+      .map(e => ({
+        name: e.name,
+        entityType: e.entityType,
+        project: e.project,
+        status: e.status,
+        tags: e.tags || [],
+        updated: e.updated,
+        path: e.path!,
+      }))
+      .sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  // ---------------------------------------------------------------------------
+  // Sessions
+  // ---------------------------------------------------------------------------
+
   async createSessionMoc(params: CreateSessionMocParams): Promise<{ entityName: string; filePath: string }> {
-    await this.ensureMemoryDir();
+    const index = await this.buildIndex();
 
     const now = new Date();
     const year = now.getFullYear();
@@ -402,180 +467,124 @@ export class MarkdownStorageManager {
 
     const cleanTitle = params.title.trim().replace(/^Session\s+/, '');
     const entityName = `Session ${dateStr} ${cleanTitle}`;
-    const filePath = getEntityPath(entityName);
+    const filePath = this.placementPath(entityName, resolveFolder({ name: entityName, entityType: 'session', now }));
 
-    // 1. Find previous / parent session file
+    // 1. Find previous / parent session
     let prevSessionName: string | null = null;
     if (params.parentSession) {
-      const cleanParent = params.parentSession.replace(/\.md$/, '').trim();
-      prevSessionName = cleanParent;
+      prevSessionName = params.parentSession.replace(/\.md$/, '').trim();
     } else {
-      const files = await fs.readdir(this.memoryDir);
-      const sessionFiles = files
-        .filter(f => f.startsWith('Session ') && f.endsWith('.md') && !f.includes('Index'))
+      const sessionNames = [...index.keys()]
+        .filter(n => n.startsWith('Session ') && !n.includes('Index') && n !== entityName)
         .sort()
         .reverse();
-      
-      for (const sf of sessionFiles) {
-        const name = sf.replace(/\.md$/, '');
-        if (name !== entityName) {
-          prevSessionName = name;
-          break;
-        }
-      }
+      prevSessionName = sessionNames[0] || null;
     }
 
-    // 2. Prepare tags
+    // 2. Tags / project
     const tagsSet = new Set<string>();
     tagsSet.add('session');
     tagsSet.add(monthTag);
     if (params.tags && Array.isArray(params.tags)) {
       params.tags.forEach(t => tagsSet.add(t.trim().replace(/^#/, '')));
     }
+    const project = normalizeProject(params.project) || projectFromTags([...tagsSet]);
+    if (project) tagsSet.add(`project/${project}`);
 
-    // 3. Prepare frontmatter
+    // 3. Frontmatter
     const frontmatter: Record<string, any> = {
       entityType: 'session',
       tags: Array.from(tagsSet),
       created: todayYMD,
       updated: todayYMD
     };
+    if (project) frontmatter.project = project;
 
-    // 4. Build MOC content sections
+    // 4. Body
     let content = matter.stringify('', frontmatter);
     content += `# ${entityName}\n\n`;
-
-    // Overview section
     content += `## 概要\n${params.overview.trim()}\n\n`;
 
-    // Navigation section
     content += `## ナビゲーション\n`;
-    content += `- ⬆️ 目次: [[Sessions Index]]\n`;
-    if (prevSessionName) {
-      content += `- ⬅️ 前のセッション: [[followed_by::${prevSessionName}]]\n`;
-    }
+    content += `- ⬆️ 目次: [[${SESSIONS_INDEX}]]\n`;
+    if (project) content += `- 🏠 プロジェクト: [[${project}]]\n`;
+    if (prevSessionName) content += `- ⬅️ 前のセッション: [[followed_by::${prevSessionName}]]\n`;
     content += `\n`;
 
-    // Topics section
-    if (params.topics && params.topics.length > 0) {
-      content += `## 相談・議論内容\n`;
-      for (const t of params.topics) {
-        content += `- ${t}\n`;
+    const section = (title: string, items?: string[]) => {
+      if (items && items.length > 0) {
+        content += `## ${title}\n`;
+        for (const i of items) content += `- ${i}\n`;
+        content += `\n`;
       }
-      content += `\n`;
-    }
-
-    // Decisions section
-    if (params.decisions && params.decisions.length > 0) {
-      content += `## 決定事項 (Decisions)\n`;
-      for (const d of params.decisions) {
-        content += `- ${d}\n`;
-      }
-      content += `\n`;
-    }
-
-    // Tips section
-    if (params.tips && params.tips.length > 0) {
-      content += `## 知見・Tips (Knowledge)\n`;
-      for (const t of params.tips) {
-        content += `- ${t}\n`;
-      }
-      content += `\n`;
-    }
-
-    // Related entities (Map of Content)
+    };
+    section('相談・議論内容', params.topics);
+    section('決定事項 (Decisions)', params.decisions);
+    section('知見・Tips (Knowledge)', params.tips);
     if (params.relatedEntities && params.relatedEntities.length > 0) {
-      content += `## 関連ノート（Map of Content）\n`;
-      for (const re of params.relatedEntities) {
-        content += `- [[${re.trim()}]]\n`;
-      }
-      content += `\n`;
+      section('関連ノート（Map of Content）', params.relatedEntities.map(re => `[[${re.trim()}]]`));
     }
+    section('次回への申し送り (Next Steps)', params.nextSteps);
 
-    // Next steps
-    if (params.nextSteps && params.nextSteps.length > 0) {
-      content += `## 次回への申し送り (Next Steps)\n`;
-      for (const ns of params.nextSteps) {
-        content += `- ${ns}\n`;
-      }
-      content += `\n`;
-    }
-
-    // Observations section (for standard MCP memory search)
+    // Observations (for standard MCP memory search)
     content += `## Observations\n`;
     content += `- 概要: ${params.overview.trim()}\n`;
-    if (params.topics) {
-      params.topics.forEach(t => { content += `- 相談: ${t}\n`; });
-    }
-    if (params.decisions) {
-      params.decisions.forEach(d => { content += `- 決定: ${d}\n`; });
-    }
-    if (params.tips) {
-      params.tips.forEach(t => { content += `- Tips: ${t}\n`; });
-    }
-    if (params.nextSteps) {
-      params.nextSteps.forEach(ns => { content += `- 申し送り: ${ns}\n`; });
-    }
+    params.topics?.forEach(t => { content += `- 相談: ${t}\n`; });
+    params.decisions?.forEach(d => { content += `- 決定: ${d}\n`; });
+    params.tips?.forEach(t => { content += `- Tips: ${t}\n`; });
+    params.nextSteps?.forEach(ns => { content += `- 申し送り: ${ns}\n`; });
     content += `\n`;
 
-    // Relations section
     content += `## Relations\n`;
-    content += `- [[indexed_in::Sessions Index]]\n`;
-    if (prevSessionName) {
-      content += `- [[followed_by::${prevSessionName}]]\n`;
-    }
-    if (params.relatedEntities) {
-      for (const re of params.relatedEntities) {
-        content += `- [[related_to::${re.trim()}]]\n`;
-      }
-    }
+    content += `- [[indexed_in::${SESSIONS_INDEX}]]\n`;
+    if (prevSessionName) content += `- [[followed_by::${prevSessionName}]]\n`;
+    params.relatedEntities?.forEach(re => { content += `- [[related_to::${re.trim()}]]\n`; });
     content += `\n`;
 
-    // Write the new session file
+    await this.ensureDir(path.dirname(filePath));
     await fs.writeFile(filePath, content, 'utf-8');
+    index.set(entityName, filePath);
 
-    // 5. Update previous session file with forward link
+    // 5. Forward link on the previous session
     if (prevSessionName) {
-      const prevPath = getEntityPath(prevSessionName);
-      try {
-        let prevContent = await fs.readFile(prevPath, 'utf-8');
-        if (prevContent.includes('## ナビゲーション')) {
-          prevContent = prevContent.replace(
-            '## ナビゲーション\n',
-            `## ナビゲーション\n- ➡️ 次のセッション: [[preceded_by::${entityName}]]\n`
-          );
+      const prevPath = await this.resolvePath(prevSessionName, index);
+      if (prevPath) {
+        try {
+          let prevContent = await fs.readFile(prevPath, 'utf-8');
+          if (prevContent.includes('## ナビゲーション\n')) {
+            prevContent = prevContent.replace(
+              '## ナビゲーション\n',
+              `## ナビゲーション\n- ➡️ 次のセッション: [[preceded_by::${entityName}]]\n`
+            );
+          }
+          const updatedPrev = addRelationToContent(prevContent, {
+            from: prevSessionName,
+            to: entityName,
+            relationType: 'preceded_by'
+          });
+          await fs.writeFile(prevPath, updatedPrev, 'utf-8');
+        } catch (e) {
+          console.error(`Failed to update forward link in ${prevSessionName}:`, e);
         }
-        const updatedPrev = addRelationToContent(prevContent, {
-          from: prevSessionName,
-          to: entityName,
-          relationType: 'preceded_by'
-        });
-        await fs.writeFile(prevPath, updatedPrev, 'utf-8');
-      } catch (e) {
-        console.error(`Failed to update forward link in ${prevSessionName}:`, e);
+      } else {
+        console.error(`Previous session ${prevSessionName} not found; forward link skipped`);
       }
     }
 
-    // 6. Update Sessions Index.md
-    const indexPath = path.join(this.memoryDir, 'Sessions Index.md');
-    try {
+    // 6. Sessions Index (found anywhere in the vault; created under _system/)
+    const entryText = `- [[${entityName}]]\n  - 主な内容: ${params.overview.trim()}\n`;
+    const indexPath = await this.resolvePath(SESSIONS_INDEX, index);
+    if (indexPath) {
       let indexContent = await fs.readFile(indexPath, 'utf-8');
-      const entryText = `- [[${entityName}]]\n  - 主な内容: ${params.overview.trim()}\n`;
-      if (indexContent.includes('## セッション一覧（新しい順）\n\n')) {
-        indexContent = indexContent.replace(
-          '## セッション一覧（新しい順）\n\n',
-          `## セッション一覧（新しい順）\n\n${entryText}`
-        );
-        await fs.writeFile(indexPath, indexContent, 'utf-8');
-      } else if (indexContent.includes('## セッション一覧（新しい順）\n')) {
-        indexContent = indexContent.replace(
-          '## セッション一覧（新しい順）\n',
-          `## セッション一覧（新しい順）\n${entryText}`
-        );
-        await fs.writeFile(indexPath, indexContent, 'utf-8');
+      for (const header of ['## セッション一覧（新しい順）\n\n', '## セッション一覧（新しい順）\n']) {
+        if (indexContent.includes(header)) {
+          indexContent = indexContent.replace(header, `${header}${entryText}`);
+          await fs.writeFile(indexPath, indexContent, 'utf-8');
+          break;
+        }
       }
-    } catch (e) {
-      // Create Sessions Index if not present
+    } else {
+      const newIndexPath = this.placementPath(SESSIONS_INDEX, FOLDERS.system);
       const newIndex = `---
 entityType: index
 tags:
@@ -591,25 +600,21 @@ updated: '${todayYMD}'
 
 ## セッション一覧（新しい順）
 
-- [[${entityName}]]
-  - 主な内容: ${params.overview.trim()}
-
+${entryText}
 ---
 
 ## Dataview（プラグイン有効時）
 
 \`\`\`dataview
-TABLE created, tags, file.outlinks AS "Links"
-FROM #session AND !"Sessions Index"
+TABLE created, project, tags, file.outlinks AS "Links"
+FROM "${FOLDERS.sessions}"
 SORT file.name DESC
 \`\`\`
 `;
-      await fs.writeFile(indexPath, newIndex, 'utf-8');
+      await this.ensureDir(path.dirname(newIndexPath));
+      await fs.writeFile(newIndexPath, newIndex, 'utf-8');
     }
 
-    return {
-      entityName,
-      filePath
-    };
+    return { entityName, filePath: this.rel(filePath) };
   }
 }
